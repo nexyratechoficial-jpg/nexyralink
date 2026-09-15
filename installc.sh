@@ -850,7 +850,7 @@ show_summary() {
 # INSTALAÇÃO PRINCIPAL
 # ─────────────────────────────────────────────────────────────
 # Implementacao atual. As funcoes abaixo substituem as versoes legadas.
-AGENT_VERSION="3.1.0"
+AGENT_VERSION="3.2.0"
 
 install_basic_deps() {
     apt-get update -y
@@ -891,7 +891,7 @@ clean_installation() {
     rm -f "$SERVICE_FILE" "$MENU_CMD"
     if [ -d "$APP_DIR" ]; then
         SAFE_BACKUP="/opt/nexyra-link-backup-$TIMESTAMP"; mkdir -p "$SAFE_BACKUP"
-        for f in config.json node-state.json history-queue.json node-history.jsonl; do [ -f "$APP_DIR/$f" ] && cp -a "$APP_DIR/$f" "$SAFE_BACKUP/"; done
+        for f in config.json node-state.json history-queue.json node-history.jsonl mikrotik-state.json; do [ -f "$APP_DIR/$f" ] && cp -a "$APP_DIR/$f" "$SAFE_BACKUP/"; done
         log "Backup salvo em $SAFE_BACKUP"
     fi
     rm -rf "$APP_DIR"; systemctl daemon-reload
@@ -903,9 +903,9 @@ create_js_file() {
 'use strict';
 const fs=require('fs'),net=require('net'),{execFile}=require('child_process'),{RouterOSAPI}=require('node-routeros');
 const dir='/opt/nexyra-link/',cfg=JSON.parse(fs.readFileSync(dir+'config.json','utf8')),base=cfg.base_url.replace(/\/$/,'');
-const sf=dir+'node-state.json',qf=dir+'history-queue.json',hf=dir+'node-history.jsonl';
+const sf=dir+'node-state.json',qf=dir+'history-queue.json',hf=dir+'node-history.jsonl',mf=dir+'mikrotik-state.json';
 const read=(p,d)=>{try{return JSON.parse(fs.readFileSync(p,'utf8'))}catch{return d}},write=(p,v)=>{fs.writeFileSync(p+'.tmp',JSON.stringify(v));fs.renameSync(p+'.tmp',p)};
-let states=read(sf,{}),queue=read(qf,[]),running=false;
+let states=read(sf,{}),queue=read(qf,[]),mikrotikStates=read(mf,{}),running=false;
 async function req(url,opt={}){const c=new AbortController(),t=setTimeout(()=>c.abort(),15000);try{const r=await fetch(url,{...opt,signal:c.signal}),s=(await r.text()).replace(/^\uFEFF+/,'').trim(),j=s?JSON.parse(s):{};if(!r.ok||j.success===false)throw Error(j.message||j.error||('HTTP '+r.status));return j}finally{clearTimeout(t)}}
 const post=(a,d)=>req(base+'/api.php?action='+a,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(d)}),update=d=>req(base+'/update_node_1.php',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({...d,key:cfg.key})}),payload=()=>req(base+'/api.php?action=get_monitor_payload&key='+encodeURIComponent(cfg.key));
 const ping=h=>new Promise(ok=>execFile('ping',['-c','1','-W','2',h],{timeout:4000},e=>ok(!e))),tcp=(h,p)=>new Promise(ok=>{const s=new net.Socket();let done=false,end=v=>{if(!done){done=true;s.destroy();ok(v)}};s.setTimeout(cfg.timeout_ms||2200);s.once('connect',()=>end(true));s.once('timeout',()=>end(false));s.once('error',()=>end(false));s.connect(p,h)});
@@ -913,9 +913,10 @@ async function detect(h){if(await ping(h))return{online:true,port:null};for(cons
 function archive(e){fs.appendFileSync(hf,JSON.stringify(e)+'\n');if(fs.statSync(hf).size>25*1024*1024){const x=fs.readFileSync(hf,'utf8').trim().split('\n').slice(-100000);fs.writeFileSync(hf+'.tmp',x.join('\n')+'\n');fs.renameSync(hf+'.tmp',hf)}}
 async function flush(){while(queue.length)try{await update(queue[0]);queue.shift();write(qf,queue)}catch(e){console.error('Fila:',e.message);return}}
 async function check(n,uid){const now=Date.now(),r=await detect(n.ip),old=states[n.id]||{status:n.status||'unknown',failed:null};let status='online',failed=null;if(!r.online){failed=old.failed||now;status=now-failed>=(cfg.offline_threshold_ms||60000)?'offline':old.status}const e={id:Number(n.id),uid,status,detected_port:r.port,checked_at:new Date().toISOString()};if(status!==old.status){queue.push(e);archive({...e,old_status:old.status});write(qf,queue)}else try{await update(e)}catch(x){console.error('Node '+n.id+':',x.message)}states[n.id]={status,failed};write(sf,states)}
-async function pppoe(m){const ros=new RouterOSAPI({host:m.host,port:Number(m.port||8728),user:m.username,password:String(m.password),tls:Boolean(Number(m.use_ssl)),timeout:10,keepalive:false});try{await ros.connect();const rows=await ros.write('/ppp/active/print');return rows.map(x=>({username:x.name,address:x.address||null,uptime:x.uptime||null,caller_id:x['caller-id']||null,service:x.service||null}))}finally{try{ros.close()}catch{}}}
+async function pppoe(m){const ros=new RouterOSAPI({host:m.host,port:Number(m.port||8728),user:m.username,password:String(m.password),tls:Boolean(Number(m.use_ssl)),timeout:10,keepalive:false});try{await ros.connect();const rows=await ros.write('/ppp/active/print');return rows.map(x=>({username:x.name,address:x.address||null,uptime:x.uptime||null,caller_id:x['caller-id']||null,service:x.service||null,rx_bytes:Number(x['bytes-in']||0),tx_bytes:Number(x['bytes-out']||0)}))}finally{try{ros.close()}catch{}}}
+async function syncMikrotik(m){const old=mikrotikStates[m.id]||{connected:false,clients:{}};try{const clients=await pppoe(m),current=Object.fromEntries(clients.map(c=>[c.username,c])),events=[];for(const c of clients)if(!old.clients[c.username])events.push({type:'connected',notify:old.connected,username:c.username,address:c.address,rx_bytes:c.rx_bytes,tx_bytes:c.tx_bytes});for(const [username,c] of Object.entries(old.clients))if(!current[username])events.push({type:'disconnected',username,address:c.address,rx_bytes:c.rx_bytes||0,tx_bytes:c.tx_bytes||0});if(!old.connected)events.push({type:'router_connected'});mikrotikStates[m.id]={connected:true,clients:current,checked_at:new Date().toISOString()};write(mf,mikrotikStates);await post('update_pppoe_clients',{key:cfg.key,mikrotik_id:m.id,clients,events})}catch(e){const events=[];if(old.connected){events.push({type:'router_disconnected'});for(const [username,c] of Object.entries(old.clients))events.push({type:'router_disconnected_client',username,address:c.address,rx_bytes:c.rx_bytes||0,tx_bytes:c.tx_bytes||0})}mikrotikStates[m.id]={connected:false,clients:{},checked_at:new Date().toISOString(),error:e.message};write(mf,mikrotikStates);await post('mikrotik_error',{key:cfg.key,mikrotik_id:m.id,error:e.message,events});console.error('MikroTik '+m.name+':',e.message)}}
 async function pool(items,n,fn){const q=[...items];await Promise.all(Array.from({length:Math.min(n,q.length)},async()=>{while(q.length)await fn(q.shift())}))}
-async function run(){if(running)return;running=true;try{await flush();const d=await payload();await post('monitoring_heartbeat',{uid:d.user.uid,server_ip:d.request_ip});await pool(d.nodes||[],cfg.max_concurrent||10,n=>check(n,d.user.uid));await flush();if(!d.credentials_allowed&&(d.mikrotiks||[]).length)console.error('Credenciais bloqueadas para '+d.request_ip);for(const m of d.mikrotiks||[])if(m.password)try{await post('update_pppoe_clients',{key:cfg.key,mikrotik_id:m.id,clients:await pppoe(m)})}catch(e){console.error('MikroTik '+m.name+':',e.message);try{await post('mikrotik_error',{key:cfg.key,mikrotik_id:m.id,error:e.message})}catch{}}}catch(e){console.error(new Date().toISOString(),e.message)}finally{running=false}}
+async function run(){if(running)return;running=true;try{await flush();const d=await payload();await post('monitoring_heartbeat',{uid:d.user.uid,server_ip:d.request_ip});await pool(d.nodes||[],cfg.max_concurrent||10,n=>check(n,d.user.uid));await flush();if(!d.credentials_allowed&&(d.mikrotiks||[]).length)console.error('Credenciais bloqueadas para '+d.request_ip);for(const m of d.mikrotiks||[])if(m.password)await syncMikrotik(m)}catch(e){console.error(new Date().toISOString(),e.message)}finally{running=false}}
 console.log('Nexyra Link Agent v'+cfg.version);run();setInterval(run,cfg.check_interval_ms||30000);
 EOF
     cd "$APP_DIR"; npm init -y >/dev/null 2>&1
